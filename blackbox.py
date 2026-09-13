@@ -36,12 +36,38 @@ MONITORED_FOLDERS = [
 
 PRUNE_INTERVAL_HOURS = 1
 PRUNE_OLDER_THAN_DAYS = 30
-NETWORK_POLL_INTERVAL_SECONDS = 2
+
+# The only continuously running cost in the whole recorder. One poll measures
+# ~2.9ms, so 5s is ~0.06% of a core; drop to 2s for finer resolution at ~0.14%.
+NETWORK_POLL_INTERVAL_SECONDS = 5
+# "tcp" is roughly twice as cheap as "inet" but stops recording UDP, which
+# hides QUIC - most browser traffic. Only narrow this if battery life matters
+# more than seeing HTTP/3.
+NETWORK_CONNECTION_KIND = "inet"
 WATCHED_CONNECTION_STATUSES = ("ESTABLISHED", "SYN_SENT")
+
+# Both WMI watchers block in the kernel until an event arrives, costing nothing
+# while they wait. This only controls how often that wait is interrupted to loop,
+# so keep it long - a short timeout wakes the CPU for no reason.
+WMI_TIMEOUT_MS = 30_000
 
 # Windows apps emit a burst of modify events per single save; collapse repeats
 # on the same path inside this window.
 MODIFY_DEBOUNCE_SECONDS = 1.0
+
+# Churn that costs write volume without telling you anything. Editors and
+# browsers touch these constantly; the meaningful event is the final file
+# appearing, which still gets recorded.
+IGNORED_FILE_SUFFIXES = (".tmp", ".temp", ".crdownload", ".part", ".partial", ".swp", ".lock")
+IGNORED_PATH_FRAGMENTS = ("\\~$", "\\.git\\", "\\node_modules\\", "\\__pycache__\\", "\\.venv\\")
+
+# Console writes on Windows cost more than the DB insert they accompany. Leave
+# this off for the scheduled task; turn it on to watch events live.
+ECHO_EVENTS = False
+
+# Run below normal CPU and I/O priority so the recorder never competes with
+# whatever you are actually doing.
+LOWER_OWN_PRIORITY = True
 
 # ============================================================================
 # Database
@@ -85,8 +111,9 @@ def log_event(kind, detail):
         )
         db_conn.commit()
 
-    # Under pythonw.exe sys.stdout is None and print() is a silent no-op.
-    print(f"[{timestamp}] {kind}: {detail_json}")
+    # Under pythonw.exe sys.stdout is None and print() is a silent no-op anyway.
+    if ECHO_EVENTS:
+        print(f"[{timestamp}] {kind}: {detail_json}")
 
 
 def prune_old_events():
@@ -136,7 +163,7 @@ def read_cmdline(pid):
         return None
 
 
-def next_wmi_event(watcher, timeout_ms=1000):
+def next_wmi_event(watcher, timeout_ms=WMI_TIMEOUT_MS):
     try:
         return watcher(timeout_ms=timeout_ms)
     except wmi.x_wmi_timed_out:
@@ -153,24 +180,30 @@ def monitor_network():
     while True:
         time.sleep(NETWORK_POLL_INTERVAL_SECONDS)
         current = current_connections()
+        new_connections = current - seen
+        seen = current
 
-        for key in current - seen:
-            pid, remote_ip, remote_port, local_port, status = key
+        # One name lookup per pid per poll rather than per connection - a browser
+        # can open dozens of sockets at once. Deliberately not cached across
+        # polls: Windows recycles PIDs, and a wrong name is worse than a lookup.
+        names = {}
+        for pid, remote_ip, remote_port, local_port, status in new_connections:
+            if pid not in names:
+                names[pid] = read_process_name(pid)
+
             log_event("network_connection", {
                 "pid": pid,
-                "process_name": read_process_name(pid),
+                "process_name": names[pid],
                 "remote_ip": remote_ip,
                 "remote_port": remote_port,
                 "local_port": local_port,
                 "status": status,
             })
 
-        seen = current
-
 
 def current_connections():
     try:
-        connections = psutil.net_connections(kind="inet")
+        connections = psutil.net_connections(kind=NETWORK_CONNECTION_KIND)
     except psutil.AccessDenied:
         return set()
 
@@ -203,22 +236,22 @@ class FileEventHandler(FileSystemEventHandler):
         self.last_modify = {}
 
     def on_created(self, event):
-        if event.is_directory or is_own_path(event.src_path):
+        if event.is_directory or is_ignored(event.src_path):
             return
         log_event("file_create", {"path": event.src_path})
 
     def on_deleted(self, event):
-        if event.is_directory or is_own_path(event.src_path):
+        if event.is_directory or is_ignored(event.src_path):
             return
         log_event("file_delete", {"path": event.src_path})
 
     def on_moved(self, event):
-        if event.is_directory or is_own_path(event.src_path):
+        if event.is_directory or is_ignored(event.src_path):
             return
         log_event("file_move", {"from_path": event.src_path, "to_path": event.dest_path})
 
     def on_modified(self, event):
-        if event.is_directory or is_own_path(event.src_path):
+        if event.is_directory or is_ignored(event.src_path):
             return
 
         now = time.monotonic()
@@ -239,8 +272,13 @@ class FileEventHandler(FileSystemEventHandler):
 OWN_PATH_PREFIX = str(SCRIPT_DIR).lower()
 
 
-def is_own_path(path):
-    return path.lower().startswith(OWN_PATH_PREFIX)
+def is_ignored(path):
+    lowered = path.lower()
+    if lowered.startswith(OWN_PATH_PREFIX):
+        return True
+    if lowered.endswith(IGNORED_FILE_SUFFIXES):
+        return True
+    return any(fragment in lowered for fragment in IGNORED_PATH_FRAGMENTS)
 
 
 def start_file_observer():
@@ -287,8 +325,19 @@ def monitor_usb():
 # Main
 # ============================================================================
 
+def lower_own_priority():
+    own = psutil.Process()
+    try:
+        own.nice(psutil.BELOW_NORMAL_PRIORITY_CLASS)
+        own.ionice(psutil.IOPRIO_LOW)
+    except psutil.AccessDenied:
+        print("could not lower own priority")
+
+
 def main():
     print(f"blackbox starting - db: {DB_PATH}")
+    if LOWER_OWN_PRIORITY:
+        lower_own_priority()
     init_database()
 
     observer = start_file_observer()
