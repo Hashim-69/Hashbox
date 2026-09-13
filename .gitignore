@@ -1,0 +1,10 @@
+# The recorded data is a detailed log of local activity - never commit it.
+blackbox.db
+blackbox.db-wal
+blackbox.db-shm
+
+.claude/
+__pycache__/
+*.pyc
+.venv/
+venv/

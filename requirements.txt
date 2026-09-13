@@ -1,0 +1,4 @@
+psutil>=5.9.0
+pywin32>=305
+wmi>=1.5.1
+watchdog>=3.0.0
