@@ -1,4 +1,12 @@
-psutil>=5.9.0
-pywin32>=305
-wmi>=1.5.1
-watchdog>=3.0.0
+# Pinned exactly. This process runs elevated at boot, so a compromised release
+# of any of these would execute with administrator rights - tracking "latest"
+# is not a risk worth taking for a four-package dependency set. Bump these
+# deliberately, not incidentally.
+#
+# Versions match what is installed and working on the recording machine, except
+# wmi which is at its current release. For full supply-chain protection also
+# pin hashes and install with --require-hashes; see SETUP.md.
+psutil==7.2.1
+pywin32==312
+wmi==1.5.1
+watchdog==6.0.0

@@ -3,11 +3,15 @@ Canned reads over blackbox.db. Run with no arguments for usage.
 """
 
 import json
+import os
 import sqlite3
 import sys
 from pathlib import Path
 
-DB_PATH = Path(__file__).resolve().parent / "blackbox.db"
+# Must match DATA_DIR/DB_PATH in blackbox.py. Duplicated rather than imported:
+# importing blackbox.py would pull in wmi and start nothing useful, and a
+# shared config module is more machinery than two constants justify.
+DB_PATH = Path(os.environ.get("ProgramData", r"C:\ProgramData")) / "Hashbox" / "blackbox.db"
 
 
 def fetch(sql, params=()):
@@ -27,6 +31,11 @@ def show(title, rows):
 
     for event_id, timestamp, kind, detail in rows:
         print(f"[{event_id}] {timestamp} | {kind}")
+        # This json.dumps is load-bearing, not cosmetic. Recorded values are
+        # attacker-controlled - a process picks its own command line - and it
+        # re-escapes control characters and bidi overrides, so ANSI escapes
+        # cannot repaint your terminal and U+202E cannot disguise an extension
+        # as it prints. Printing these fields directly would undo that.
         print(json.dumps(json.loads(detail), indent=2))
         print()
 
@@ -86,6 +95,19 @@ USAGE = """blackbox query tool
 """
 
 
+def parse_count(value):
+    # SQLite reads a negative LIMIT as "no limit", so an accidental minus sign
+    # would dump the entire 30 days instead of the handful you asked for.
+    try:
+        count = int(value)
+    except ValueError:
+        sys.exit(f"'{value}' is not a number")
+
+    if count < 1:
+        sys.exit("count must be 1 or more")
+    return count
+
+
 def main():
     if not DB_PATH.exists():
         sys.exit(f"no database at {DB_PATH} - run blackbox.py first")
@@ -97,7 +119,7 @@ def main():
     command = args[0].lower()
 
     if command == "last":
-        last_n_events(int(args[1]) if len(args) > 1 else 50)
+        last_n_events(parse_count(args[1]) if len(args) > 1 else 50)
         return
 
     if command == "usb":

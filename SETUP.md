@@ -1,24 +1,70 @@
 # BlackBox Event Recorder
 
 Records process creation, outbound network connections, file activity in
-Desktop/Documents/Downloads, and USB volume insert/remove into `blackbox.db`
-next to the script. Rows older than 30 days are pruned hourly.
+Desktop/Documents/Downloads, and USB volume insert/remove into
+`C:\ProgramData\Hashbox\blackbox.db`. Rows older than 30 days are pruned hourly.
 
 Edit the constants at the top of `blackbox.py` to change folders, poll
 interval, or retention.
 
+## Where this must live
+
+Both of these matter, and both are about the same thing — this process runs
+**elevated at every boot**, so anything it reads or executes must not be
+writable by a non-administrator:
+
+- **The script does not belong on your Desktop.** Your profile is writable
+  without elevation, so any process running as you could append a line to
+  `blackbox.py` and have it execute with administrator rights at the next
+  boot. Put it somewhere only administrators can write.
+- **The database does not belong next to the script.** It holds 30 days of
+  command lines, file paths and network destinations. On Desktop it inherits
+  that folder's ACL and is readable by anything running as you.
+
 ## Install
 
-```
-pip install -r requirements.txt
-python blackbox.py
-```
+Run all of this from an **elevated** terminal. Without elevation
+`Win32_ProcessStartTrace` fails and `psutil.net_connections` cannot see other
+accounts' sockets.
 
-Ctrl+C to stop. Run this from an **elevated** terminal first — without
-elevation `Win32_ProcessStartTrace` fails and `psutil.net_connections` cannot
-see other accounts' sockets.
+1. Put the code somewhere non-administrators cannot modify:
 
-Query it:
+   ```
+   mkdir "C:\Program Files\Hashbox"
+   copy blackbox.py query.py requirements.txt "C:\Program Files\Hashbox\"
+   ```
+
+2. Create the data directory and lock it down. `/inheritance:r` drops the
+   inherited permissions that would otherwise let your own account read it:
+
+   ```
+   mkdir "C:\ProgramData\Hashbox"
+   icacls "C:\ProgramData\Hashbox" /inheritance:r /grant:r "Administrators:(OI)(CI)F" "SYSTEM:(OI)(CI)F"
+   ```
+
+   Verify with `icacls "C:\ProgramData\Hashbox"` — only those two entries
+   should be listed. From then on `query.py` also needs an elevated terminal,
+   which is the point.
+
+3. Install the pinned dependencies and run it:
+
+   ```
+   pip install -r requirements.txt
+   python "C:\Program Files\Hashbox\blackbox.py"
+   ```
+
+   Ctrl+C to stop.
+
+   For supply-chain protection, generate hashes once and install with
+   `--require-hashes` — a compromised package release would otherwise run
+   elevated:
+
+   ```
+   pip hash <downloaded-wheel>
+   pip install --require-hashes -r requirements.txt
+   ```
+
+Query it (elevated, per step 2):
 
 ```
 python query.py last 20
@@ -55,12 +101,15 @@ python query.py last 20
      `pip install` against, or the imports will fail.
    - **Add arguments:** (keep the quotes)
      ```
-     "C:\Users\<you>\Desktop\blackbox\blackbox.py"
+     "C:\Program Files\Hashbox\blackbox.py"
      ```
    - **Start in:** (no quotes)
      ```
-     C:\Users\<you>\Desktop\blackbox
+     C:\Program Files\Hashbox
      ```
+     Point these at the protected copy from the Install step, not at a copy in
+     your profile — a task with highest privileges pointed at a user-writable
+     script is a local privilege escalation waiting to happen.
    - **OK**
 
 6. **Conditions tab**
@@ -104,6 +153,15 @@ python query.py last 20
 - Command line is captured via psutil after the fact, so very short-lived
   processes log `"cmdline": null` — the PID, parent PID, and image name still
   come from the WMI trace and are always present.
+- Command lines are passed through a redaction denylist before being stored, so
+  `--password`, `--token`, `-H`, `-p<value>` and recognisable key shapes
+  (`ghp_`, `sk-`, `AKIA`, …) are replaced with `<redacted>`. **This is damage
+  reduction, not a guarantee** — no denylist knows every tool's flags, and
+  things like `curl -u user:pass` still get through. The directory ACL from the
+  Install step is the real control; treat the DB as sensitive regardless.
+- The DB is not tamper-evident. Anyone who can read it can also delete rows, so
+  it is evidence for you, not evidence against a determined attacker who
+  already has administrator rights on this machine.
 
 ## Troubleshooting
 
@@ -121,3 +179,9 @@ General tab, or hardcode absolute paths in `MONITORED_FOLDERS`.
 
 **`database is locked`**
 Two instances are running. Settings tab must be `Do not start a new instance`.
+
+**`PermissionError` from `query.py`, or "no database at ..."**
+Expected after the `icacls` step — the DB is readable by administrators only.
+Run `query.py` from an elevated terminal. If it persists, confirm the recorder
+actually created `C:\ProgramData\Hashbox\blackbox.db`; an elevated task writes
+there, a non-elevated manual run may not be able to.

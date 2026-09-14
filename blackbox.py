@@ -5,6 +5,8 @@ Run with pythonw.exe at boot via Task Scheduler, elevated. See SETUP.md.
 """
 
 import json
+import os
+import re
 import sqlite3
 import threading
 import time
@@ -22,7 +24,15 @@ from watchdog.observers import Observer
 # ============================================================================
 
 SCRIPT_DIR = Path(__file__).resolve().parent
-DB_PATH = SCRIPT_DIR / "blackbox.db"
+
+# The DB holds 30 days of command lines, file paths and network destinations -
+# it is the most sensitive file on the machine. Keeping it out of the script
+# directory matters because that directory is user-writable: anything running
+# as you could otherwise read the whole history, and could overwrite
+# blackbox.py itself, which then runs elevated at the next boot. SETUP.md has
+# the icacls that locks DATA_DIR down to Administrators and SYSTEM.
+DATA_DIR = Path(os.environ.get("ProgramData", r"C:\ProgramData")) / "Hashbox"
+DB_PATH = DATA_DIR / "blackbox.db"
 
 # Path.home() resolves to whatever account the scheduled task runs as. If the
 # task runs as SYSTEM this becomes C:\Windows\system32\config\systemprofile and
@@ -38,12 +48,15 @@ PRUNE_INTERVAL_HOURS = 1
 PRUNE_OLDER_THAN_DAYS = 30
 
 # The only continuously running cost in the whole recorder. One poll measures
-# ~2.9ms, so 5s is ~0.06% of a core; drop to 2s for finer resolution at ~0.14%.
+# ~2.1ms, so 5s is ~0.04% of a core; drop to 2s for finer resolution at ~0.11%.
 NETWORK_POLL_INTERVAL_SECONDS = 5
-# "tcp" is roughly twice as cheap as "inet" but stops recording UDP, which
-# hides QUIC - most browser traffic. Only narrow this if battery life matters
-# more than seeing HTTP/3.
-NETWORK_CONNECTION_KIND = "inet"
+# UDP sockets always report a status of NONE, so the status filter below drops
+# every one of them regardless of this setting. "inet" therefore costs ~72%
+# more per poll than "tcp" while producing identical events. To genuinely
+# record UDP (and with it QUIC/HTTP-3), set this to "inet" *and* add
+# psutil.CONN_NONE to the statuses - changing one without the other does
+# nothing but burn CPU.
+NETWORK_CONNECTION_KIND = "tcp"
 WATCHED_CONNECTION_STATUSES = ("ESTABLISHED", "SYN_SENT")
 
 # Both WMI watchers block in the kernel until an event arrives, costing nothing
@@ -83,6 +96,10 @@ def utc_now_iso():
 
 def init_database():
     global db_conn
+    # exist_ok because the elevated task and a manual run share this directory;
+    # whoever gets there first creates it. The ACL comes from SETUP.md, not
+    # from here - mkdir cannot tighten an inherited one.
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
     db_conn = sqlite3.connect(str(DB_PATH), check_same_thread=False)
 
     # WAL lets query.py read while this process is writing.
@@ -136,7 +153,10 @@ def prune_old_events():
 def monitor_processes():
     pythoncom.CoInitialize()
     try:
-        watcher = wmi.WMI().Win32_ProcessStartTrace.watch_for()
+        watcher = start_watcher("process_create", "Win32_ProcessStartTrace")
+        if watcher is None:
+            return
+
         while True:
             event = next_wmi_event(watcher)
             if event is None:
@@ -156,11 +176,71 @@ def monitor_processes():
 
 def read_cmdline(pid):
     try:
-        return " ".join(psutil.Process(pid).cmdline())
+        argv = psutil.Process(pid).cmdline()
     except psutil.NoSuchProcess:
         return None
     except psutil.AccessDenied:
         return None
+
+    return " ".join(redact_secrets(argv))
+
+
+# Kept separate from read_cmdline despite the single caller: this is the one
+# piece of security logic in the file and it needs to be readable and testable
+# on its own.
+#
+# A denylist cannot know every tool's flags, so treat this as damage reduction,
+# not a guarantee - the DB's ACL is the actual control. It only stops the most
+# common secrets from sitting in the log in greppable plaintext.
+SECRET_FLAGS = (
+    "--password", "--passwd", "--pwd", "--token", "--api-key", "--apikey",
+    "--secret", "--client-secret", "--license-key", "--auth", "--credential",
+    "--header",
+)
+# Matched case-sensitively and kept apart from the long flags: curl's -H is a
+# header and worth redacting, but -h is --help on almost everything else.
+# Anything more ambiguous than this (-u, -h) is left alone, because a redaction
+# that fires on benign arguments quietly destroys the log's forensic value.
+SECRET_SHORT_FLAGS = ("-H",)
+# Recognisable credential shapes, redacted wherever they appear - covers the
+# case where a secret is passed positionally with no flag in front of it.
+TOKEN_PATTERN = re.compile(
+    r"(?:ghp_|gho_|ghs_|ghu_|github_pat_|sk-|xox[baprs]-|AKIA|ASIA)[A-Za-z0-9_\-]{8,}"
+)
+REDACTED = "<redacted>"
+
+
+def redact_secrets(argv):
+    safe = []
+    redact_next = False
+
+    for arg in argv:
+        if redact_next:
+            safe.append(REDACTED)
+            redact_next = False
+            continue
+
+        flag, separator, _ = arg.partition("=")
+        if separator and flag.lower() in SECRET_FLAGS:
+            safe.append(f"{flag}={REDACTED}")
+            continue
+
+        if arg.lower() in SECRET_FLAGS or arg in SECRET_SHORT_FLAGS:
+            redact_next = True
+            safe.append(arg)
+            continue
+
+        # mysql-style attached value: -phunter2. This also eats things like
+        # docker's -p8080:80, which is a deliberate trade - losing a port
+        # mapping from the log costs less than leaking a password into it.
+        # A bare -p is left alone; it usually means something harmless.
+        if len(arg) > 2 and arg.startswith("-p") and not arg.startswith("--"):
+            safe.append(f"-p{REDACTED}")
+            continue
+
+        safe.append(TOKEN_PATTERN.sub(REDACTED, arg))
+
+    return safe
 
 
 def next_wmi_event(watcher, timeout_ms=WMI_TIMEOUT_MS):
@@ -170,24 +250,45 @@ def next_wmi_event(watcher, timeout_ms=WMI_TIMEOUT_MS):
         return None
 
 
+def start_watcher(source, wmi_class):
+    # Win32_ProcessStartTrace needs elevation, so this fails on a normally
+    # launched run. The thread would then die mute - print() is a no-op under
+    # pythonw - and the gap only surfaces when a query comes back empty, so
+    # the failure goes in the DB where it can actually be found.
+    try:
+        return getattr(wmi.WMI(), wmi_class).watch_for()
+    except wmi.x_wmi as error:
+        log_event("monitor_error", {"source": source, "error": str(error)})
+        return None
+
+
 # ============================================================================
 # Outbound network connections - poll psutil, diff against last poll
 # ============================================================================
 
 def monitor_network():
-    seen = current_connections()
+    # Sockets already open at startup form the baseline and are never logged;
+    # only transitions after this point are events.
+    seen = current_connections() or {}
 
     while True:
         time.sleep(NETWORK_POLL_INTERVAL_SECONDS)
         current = current_connections()
-        new_connections = current - seen
+
+        # Keep the previous baseline on a failed read. Replacing it with an
+        # empty one would make every live socket look new on the next poll.
+        if current is None:
+            continue
+
+        new_keys = current.keys() - seen.keys()
         seen = current
 
         # One name lookup per pid per poll rather than per connection - a browser
         # can open dozens of sockets at once. Deliberately not cached across
         # polls: Windows recycles PIDs, and a wrong name is worse than a lookup.
         names = {}
-        for pid, remote_ip, remote_port, local_port, status in new_connections:
+        for key in new_keys:
+            pid, remote_ip, remote_port, local_port = key
             if pid not in names:
                 names[pid] = read_process_name(pid)
 
@@ -197,20 +298,22 @@ def monitor_network():
                 "remote_ip": remote_ip,
                 "remote_port": remote_port,
                 "local_port": local_port,
-                "status": status,
+                "status": current[key],
             })
 
 
 def current_connections():
+    # None rather than an empty mapping: the caller has to tell "nothing is
+    # connected" apart from "we were not allowed to look".
     try:
         connections = psutil.net_connections(kind=NETWORK_CONNECTION_KIND)
     except psutil.AccessDenied:
-        return set()
+        return None
 
-    # Status is excluded from the dedup key so a SYN_SENT that becomes
-    # ESTABLISHED is not logged twice.
+    # Status stays out of the key and rides along as the value, so a SYN_SENT
+    # that later becomes ESTABLISHED is one event rather than two.
     return {
-        (conn.pid, conn.raddr.ip, conn.raddr.port, conn.laddr.port, conn.status)
+        (conn.pid, conn.raddr.ip, conn.raddr.port, conn.laddr.port): conn.status
         for conn in connections
         if conn.raddr and conn.status in WATCHED_CONNECTION_STATUSES
     }
@@ -267,14 +370,16 @@ class FileEventHandler(FileSystemEventHandler):
         log_event("file_modify", {"path": event.src_path})
 
 
-# The DB usually lives under a monitored folder, so its own writes would be
-# recorded as file events, which would write again - an endless loop.
-OWN_PATH_PREFIX = str(SCRIPT_DIR).lower()
+# DATA_DIR is outside the monitored folders now, so the feedback loop is gone
+# by construction - but both stay excluded so that pointing DB_PATH back at a
+# watched folder cannot silently reintroduce it. A DB write would be recorded
+# as a file event, which would write again, forever.
+EXCLUDED_PREFIXES = (str(SCRIPT_DIR).lower(), str(DATA_DIR).lower())
 
 
 def is_ignored(path):
     lowered = path.lower()
-    if lowered.startswith(OWN_PATH_PREFIX):
+    if lowered.startswith(EXCLUDED_PREFIXES):
         return True
     if lowered.endswith(IGNORED_FILE_SUFFIXES):
         return True
@@ -305,7 +410,10 @@ VOLUME_EVENT_ACTIONS = {2: "insert", 3: "remove"}
 def monitor_usb():
     pythoncom.CoInitialize()
     try:
-        watcher = wmi.WMI().Win32_VolumeChangeEvent.watch_for()
+        watcher = start_watcher("usb_volume", "Win32_VolumeChangeEvent")
+        if watcher is None:
+            return
+
         while True:
             event = next_wmi_event(watcher)
             if event is None:
