@@ -5,6 +5,8 @@ Run with pythonw.exe at boot via Task Scheduler, elevated. See SETUP.md.
 """
 
 import json
+import os
+import re
 import sqlite3
 import threading
 import time
@@ -22,7 +24,15 @@ from watchdog.observers import Observer
 # ============================================================================
 
 SCRIPT_DIR = Path(__file__).resolve().parent
-DB_PATH = SCRIPT_DIR / "blackbox.db"
+
+# The DB holds 30 days of command lines, file paths and network destinations -
+# it is the most sensitive file on the machine. Keeping it out of the script
+# directory matters because that directory is user-writable: anything running
+# as you could otherwise read the whole history, and could overwrite
+# blackbox.py itself, which then runs elevated at the next boot. SETUP.md has
+# the icacls that locks DATA_DIR down to Administrators and SYSTEM.
+DATA_DIR = Path(os.environ.get("ProgramData", r"C:\ProgramData")) / "Hashbox"
+DB_PATH = DATA_DIR / "blackbox.db"
 
 # Path.home() resolves to whatever account the scheduled task runs as. If the
 # task runs as SYSTEM this becomes C:\Windows\system32\config\systemprofile and
@@ -86,6 +96,10 @@ def utc_now_iso():
 
 def init_database():
     global db_conn
+    # exist_ok because the elevated task and a manual run share this directory;
+    # whoever gets there first creates it. The ACL comes from SETUP.md, not
+    # from here - mkdir cannot tighten an inherited one.
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
     db_conn = sqlite3.connect(str(DB_PATH), check_same_thread=False)
 
     # WAL lets query.py read while this process is writing.
@@ -162,11 +176,71 @@ def monitor_processes():
 
 def read_cmdline(pid):
     try:
-        return " ".join(psutil.Process(pid).cmdline())
+        argv = psutil.Process(pid).cmdline()
     except psutil.NoSuchProcess:
         return None
     except psutil.AccessDenied:
         return None
+
+    return " ".join(redact_secrets(argv))
+
+
+# Kept separate from read_cmdline despite the single caller: this is the one
+# piece of security logic in the file and it needs to be readable and testable
+# on its own.
+#
+# A denylist cannot know every tool's flags, so treat this as damage reduction,
+# not a guarantee - the DB's ACL is the actual control. It only stops the most
+# common secrets from sitting in the log in greppable plaintext.
+SECRET_FLAGS = (
+    "--password", "--passwd", "--pwd", "--token", "--api-key", "--apikey",
+    "--secret", "--client-secret", "--license-key", "--auth", "--credential",
+    "--header",
+)
+# Matched case-sensitively and kept apart from the long flags: curl's -H is a
+# header and worth redacting, but -h is --help on almost everything else.
+# Anything more ambiguous than this (-u, -h) is left alone, because a redaction
+# that fires on benign arguments quietly destroys the log's forensic value.
+SECRET_SHORT_FLAGS = ("-H",)
+# Recognisable credential shapes, redacted wherever they appear - covers the
+# case where a secret is passed positionally with no flag in front of it.
+TOKEN_PATTERN = re.compile(
+    r"(?:ghp_|gho_|ghs_|ghu_|github_pat_|sk-|xox[baprs]-|AKIA|ASIA)[A-Za-z0-9_\-]{8,}"
+)
+REDACTED = "<redacted>"
+
+
+def redact_secrets(argv):
+    safe = []
+    redact_next = False
+
+    for arg in argv:
+        if redact_next:
+            safe.append(REDACTED)
+            redact_next = False
+            continue
+
+        flag, separator, _ = arg.partition("=")
+        if separator and flag.lower() in SECRET_FLAGS:
+            safe.append(f"{flag}={REDACTED}")
+            continue
+
+        if arg.lower() in SECRET_FLAGS or arg in SECRET_SHORT_FLAGS:
+            redact_next = True
+            safe.append(arg)
+            continue
+
+        # mysql-style attached value: -phunter2. This also eats things like
+        # docker's -p8080:80, which is a deliberate trade - losing a port
+        # mapping from the log costs less than leaking a password into it.
+        # A bare -p is left alone; it usually means something harmless.
+        if len(arg) > 2 and arg.startswith("-p") and not arg.startswith("--"):
+            safe.append(f"-p{REDACTED}")
+            continue
+
+        safe.append(TOKEN_PATTERN.sub(REDACTED, arg))
+
+    return safe
 
 
 def next_wmi_event(watcher, timeout_ms=WMI_TIMEOUT_MS):
@@ -296,14 +370,16 @@ class FileEventHandler(FileSystemEventHandler):
         log_event("file_modify", {"path": event.src_path})
 
 
-# The DB usually lives under a monitored folder, so its own writes would be
-# recorded as file events, which would write again - an endless loop.
-OWN_PATH_PREFIX = str(SCRIPT_DIR).lower()
+# DATA_DIR is outside the monitored folders now, so the feedback loop is gone
+# by construction - but both stay excluded so that pointing DB_PATH back at a
+# watched folder cannot silently reintroduce it. A DB write would be recorded
+# as a file event, which would write again, forever.
+EXCLUDED_PREFIXES = (str(SCRIPT_DIR).lower(), str(DATA_DIR).lower())
 
 
 def is_ignored(path):
     lowered = path.lower()
-    if lowered.startswith(OWN_PATH_PREFIX):
+    if lowered.startswith(EXCLUDED_PREFIXES):
         return True
     if lowered.endswith(IGNORED_FILE_SUFFIXES):
         return True
