@@ -38,12 +38,15 @@ PRUNE_INTERVAL_HOURS = 1
 PRUNE_OLDER_THAN_DAYS = 30
 
 # The only continuously running cost in the whole recorder. One poll measures
-# ~2.9ms, so 5s is ~0.06% of a core; drop to 2s for finer resolution at ~0.14%.
+# ~2.1ms, so 5s is ~0.04% of a core; drop to 2s for finer resolution at ~0.11%.
 NETWORK_POLL_INTERVAL_SECONDS = 5
-# "tcp" is roughly twice as cheap as "inet" but stops recording UDP, which
-# hides QUIC - most browser traffic. Only narrow this if battery life matters
-# more than seeing HTTP/3.
-NETWORK_CONNECTION_KIND = "inet"
+# UDP sockets always report a status of NONE, so the status filter below drops
+# every one of them regardless of this setting. "inet" therefore costs ~72%
+# more per poll than "tcp" while producing identical events. To genuinely
+# record UDP (and with it QUIC/HTTP-3), set this to "inet" *and* add
+# psutil.CONN_NONE to the statuses - changing one without the other does
+# nothing but burn CPU.
+NETWORK_CONNECTION_KIND = "tcp"
 WATCHED_CONNECTION_STATUSES = ("ESTABLISHED", "SYN_SENT")
 
 # Both WMI watchers block in the kernel until an event arrives, costing nothing
@@ -136,7 +139,10 @@ def prune_old_events():
 def monitor_processes():
     pythoncom.CoInitialize()
     try:
-        watcher = wmi.WMI().Win32_ProcessStartTrace.watch_for()
+        watcher = start_watcher("process_create", "Win32_ProcessStartTrace")
+        if watcher is None:
+            return
+
         while True:
             event = next_wmi_event(watcher)
             if event is None:
@@ -170,24 +176,45 @@ def next_wmi_event(watcher, timeout_ms=WMI_TIMEOUT_MS):
         return None
 
 
+def start_watcher(source, wmi_class):
+    # Win32_ProcessStartTrace needs elevation, so this fails on a normally
+    # launched run. The thread would then die mute - print() is a no-op under
+    # pythonw - and the gap only surfaces when a query comes back empty, so
+    # the failure goes in the DB where it can actually be found.
+    try:
+        return getattr(wmi.WMI(), wmi_class).watch_for()
+    except wmi.x_wmi as error:
+        log_event("monitor_error", {"source": source, "error": str(error)})
+        return None
+
+
 # ============================================================================
 # Outbound network connections - poll psutil, diff against last poll
 # ============================================================================
 
 def monitor_network():
-    seen = current_connections()
+    # Sockets already open at startup form the baseline and are never logged;
+    # only transitions after this point are events.
+    seen = current_connections() or {}
 
     while True:
         time.sleep(NETWORK_POLL_INTERVAL_SECONDS)
         current = current_connections()
-        new_connections = current - seen
+
+        # Keep the previous baseline on a failed read. Replacing it with an
+        # empty one would make every live socket look new on the next poll.
+        if current is None:
+            continue
+
+        new_keys = current.keys() - seen.keys()
         seen = current
 
         # One name lookup per pid per poll rather than per connection - a browser
         # can open dozens of sockets at once. Deliberately not cached across
         # polls: Windows recycles PIDs, and a wrong name is worse than a lookup.
         names = {}
-        for pid, remote_ip, remote_port, local_port, status in new_connections:
+        for key in new_keys:
+            pid, remote_ip, remote_port, local_port = key
             if pid not in names:
                 names[pid] = read_process_name(pid)
 
@@ -197,20 +224,22 @@ def monitor_network():
                 "remote_ip": remote_ip,
                 "remote_port": remote_port,
                 "local_port": local_port,
-                "status": status,
+                "status": current[key],
             })
 
 
 def current_connections():
+    # None rather than an empty mapping: the caller has to tell "nothing is
+    # connected" apart from "we were not allowed to look".
     try:
         connections = psutil.net_connections(kind=NETWORK_CONNECTION_KIND)
     except psutil.AccessDenied:
-        return set()
+        return None
 
-    # Status is excluded from the dedup key so a SYN_SENT that becomes
-    # ESTABLISHED is not logged twice.
+    # Status stays out of the key and rides along as the value, so a SYN_SENT
+    # that later becomes ESTABLISHED is one event rather than two.
     return {
-        (conn.pid, conn.raddr.ip, conn.raddr.port, conn.laddr.port, conn.status)
+        (conn.pid, conn.raddr.ip, conn.raddr.port, conn.laddr.port): conn.status
         for conn in connections
         if conn.raddr and conn.status in WATCHED_CONNECTION_STATUSES
     }
@@ -305,7 +334,10 @@ VOLUME_EVENT_ACTIONS = {2: "insert", 3: "remove"}
 def monitor_usb():
     pythoncom.CoInitialize()
     try:
-        watcher = wmi.WMI().Win32_VolumeChangeEvent.watch_for()
+        watcher = start_watcher("usb_volume", "Win32_VolumeChangeEvent")
+        if watcher is None:
+            return
+
         while True:
             event = next_wmi_event(watcher)
             if event is None:
