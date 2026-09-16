@@ -83,6 +83,10 @@ python query.py last 20
      would resolve to `C:\Windows\system32\config\systemprofile` and none of
      your real folders would be watched.
    - Select **Run whether user is logged on or not**
+   - Check **Do not store password**. The task still starts at boot before
+     anyone logs in, and your Windows password is never saved with it. What
+     that gives up is access to network shares and EFS-encrypted files, and
+     the recorder uses neither.
    - Check **Run with highest privileges** (required for process-start tracing)
    - **Configure for:** `Windows 10`
 
@@ -121,8 +125,7 @@ python query.py last 20
    - Check **Run task as soon as possible after a scheduled start is missed**
    - **If the task is already running:** `Do not start a new instance`
 
-8. **OK**, then enter your Windows password when prompted (needed for "run
-   whether user is logged on or not").
+8. **OK**. With **Do not store password** checked there is no password prompt.
 
 9. **Test:** right-click the task → **Run**. Confirm `pythonw.exe` appears in
    Task Manager → Details, then `python query.py last 10`.
@@ -154,11 +157,18 @@ python query.py last 20
   processes log `"cmdline": null` — the PID, parent PID, and image name still
   come from the WMI trace and are always present.
 - Command lines are passed through a redaction denylist before being stored, so
-  `--password`, `--token`, `-H`, `-p<value>` and recognisable key shapes
-  (`ghp_`, `sk-`, `AKIA`, …) are replaced with `<redacted>`. **This is damage
-  reduction, not a guarantee** — no denylist knows every tool's flags, and
-  things like `curl -u user:pass` still get through. The directory ACL from the
-  Install step is the real control; treat the DB as sensitive regardless.
+  `--password`, `--token`, `-H` (standalone and attached), mysql-style
+  `-p<value>` and recognisable key shapes (`ghp_`, `sk-`, `AKIA`, …) are
+  replaced with `<redacted>`. **This is damage reduction, not a guarantee** — no
+  denylist knows every tool's flags, and things like `curl -u user:pass` still
+  get through. The directory ACL from the Install step is the real control;
+  treat the DB as sensitive regardless.
+- The `-p` rule intentionally does not fire on values that could be a flag name
+  or that start with a colon, so `powershell -psconsolefile`,
+  `msbuild -p:Config=Release` and `tar -pxvf` are recorded intact. The trade is
+  that an all-alphanumeric password passed as `-psecret123` is not redacted.
+  Redaction that fires on benign arguments destroys the log's forensic value,
+  which is the thing the recorder exists to provide.
 - The DB is not tamper-evident. Anyone who can read it can also delete rows, so
   it is evidence for you, not evidence against a determined attacker who
   already has administrator rights on this machine.
