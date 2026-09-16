@@ -1,6 +1,8 @@
-"""
+r"""
 Windows event recorder - processes, outbound network, file changes, USB volumes.
-Everything lands in one SQLite DB next to this script.
+Everything lands in one SQLite DB under %ProgramData%\Hashbox, which SETUP.md
+locks down to Administrators and SYSTEM - deliberately not next to this script,
+since the script directory is user-writable.
 Run with pythonw.exe at boot via Task Scheduler, elevated. See SETUP.md.
 """
 
@@ -158,7 +160,9 @@ def monitor_processes():
             return
 
         while True:
-            event = next_wmi_event(watcher)
+            event = next_wmi_event("process_create", watcher)
+            if event is WATCHER_DEAD:
+                return
             if event is None:
                 continue
 
@@ -201,11 +205,43 @@ SECRET_FLAGS = (
 # header and worth redacting, but -h is --help on almost everything else.
 # Anything more ambiguous than this (-u, -h) is left alone, because a redaction
 # that fires on benign arguments quietly destroys the log's forensic value.
+#
+# Both the standalone form (-H value) and the attached form (-Hvalue, which curl
+# accepts) are covered - see redact_short_flag. Any short flag added here gets
+# both forms automatically, so a future addition cannot silently leak the
+# attached spelling the way -H once did.
 SECRET_SHORT_FLAGS = ("-H",)
+
+# mysql-style attached password: -phunter2. Restricted to values that cannot be
+# a long-form flag name, because -p is the single most overloaded short flag on
+# Windows: powershell -psconsolefile, msbuild -p:Config=Release, tar -pxvf and
+# node -print all start with -p, and redacting them would destroy exactly the
+# arguments an incident needs. A value made only of flag-name characters
+# (letters, digits, dash, underscore) is therefore left alone - a real password
+# containing nothing else is possible but rare, and losing one of those to the
+# log costs less than blinding the recorder to -psconsolefile. Anything with a
+# colon, slash, dot or punctuation in it is not a flag name and is redacted.
+#
+# The leading colon is excluded for the same reason: -p:Config=Release is
+# msbuild naming a property, and no tool spells a password that way.
+MYSQL_PASSWORD_FLAG = "-p"
+FLAG_NAME_CHARACTERS = re.compile(r"\A[A-Za-z0-9_\-]+\Z")
+NOT_A_PASSWORD_PREFIX = ":"
+
 # Recognisable credential shapes, redacted wherever they appear - covers the
 # case where a secret is passed positionally with no flag in front of it.
+#
+# The prefixes are split by how self-identifying they are. The github and slack
+# ones are long and effectively never occur by accident, so a short tail is
+# safe. sk- and AWS key ids are short enough to appear in ordinary text (a
+# directory named sk-experiments-01, a package name), so they require the full
+# real-world length: AWS ids are exactly 20 characters, and an OpenAI-style key
+# is far longer than the 8 a loose pattern would accept. Requiring that length
+# keeps the pattern from eating benign paths.
 TOKEN_PATTERN = re.compile(
-    r"(?:ghp_|gho_|ghs_|ghu_|github_pat_|sk-|xox[baprs]-|AKIA|ASIA)[A-Za-z0-9_\-]{8,}"
+    r"(?:(?:ghp_|gho_|ghs_|ghu_|github_pat_|xox[baprs]-)[A-Za-z0-9_\-]{8,}"
+    r"|sk-[A-Za-z0-9_\-]{20,}"
+    r"|(?:AKIA|ASIA)[A-Z0-9]{16})"
 )
 REDACTED = "<redacted>"
 
@@ -230,12 +266,9 @@ def redact_secrets(argv):
             safe.append(arg)
             continue
 
-        # mysql-style attached value: -phunter2. This also eats things like
-        # docker's -p8080:80, which is a deliberate trade - losing a port
-        # mapping from the log costs less than leaking a password into it.
-        # A bare -p is left alone; it usually means something harmless.
-        if len(arg) > 2 and arg.startswith("-p") and not arg.startswith("--"):
-            safe.append(f"-p{REDACTED}")
+        short_flag = redact_short_flag(arg)
+        if short_flag is not None:
+            safe.append(short_flag)
             continue
 
         safe.append(TOKEN_PATTERN.sub(REDACTED, arg))
@@ -243,11 +276,48 @@ def redact_secrets(argv):
     return safe
 
 
-def next_wmi_event(watcher, timeout_ms=WMI_TIMEOUT_MS):
+def redact_short_flag(arg):
+    # Returns the redacted form of an attached-value short flag, or None when
+    # the argument is not one and should be left to the token pattern.
+    if arg.startswith("--") or not arg.startswith("-") or len(arg) <= 2:
+        return None
+
+    prefix, value = arg[:2], arg[2:]
+
+    if prefix in SECRET_SHORT_FLAGS:
+        return f"{prefix}{REDACTED}"
+
+    # -p only when the value can be read neither as a long-form flag name nor
+    # as an option argument introduced by a colon.
+    if (
+        prefix == MYSQL_PASSWORD_FLAG
+        and not value.startswith(NOT_A_PASSWORD_PREFIX)
+        and not FLAG_NAME_CHARACTERS.match(value)
+    ):
+        return f"{prefix}{REDACTED}"
+
+    return None
+
+
+# Sentinel for "this watcher is dead", kept distinct from the None that a
+# routine timeout returns. A timeout means loop again; this means stop.
+WATCHER_DEAD = object()
+
+
+def next_wmi_event(source, watcher, timeout_ms=WMI_TIMEOUT_MS):
     try:
         return watcher(timeout_ms=timeout_ms)
     except wmi.x_wmi_timed_out:
         return None
+    except wmi.x_wmi as error:
+        # A watcher can also die mid-life - the COM object goes away if the WMI
+        # service restarts. Without this the exception would unwind the whole
+        # thread, past the CoUninitialize in the caller's finally, and the
+        # recorder would go quiet for that source until the next reboot with
+        # nothing in the DB to say so. That is the same silent death
+        # start_watcher already guards at setup time.
+        log_event("monitor_error", {"source": source, "error": str(error)})
+        return WATCHER_DEAD
 
 
 def start_watcher(source, wmi_class):
@@ -374,7 +444,13 @@ class FileEventHandler(FileSystemEventHandler):
 # by construction - but both stay excluded so that pointing DB_PATH back at a
 # watched folder cannot silently reintroduce it. A DB write would be recorded
 # as a file event, which would write again, forever.
-EXCLUDED_PREFIXES = (str(SCRIPT_DIR).lower(), str(DATA_DIR).lower())
+# The trailing separator matters: without it, "...\Desktop\blackbox" also
+# excludes a sibling "...\Desktop\blackbox-notes\report.docx", silently
+# dropping events from a folder that has nothing to do with the recorder.
+EXCLUDED_PREFIXES = (
+    os.path.join(str(SCRIPT_DIR).lower(), ""),
+    os.path.join(str(DATA_DIR).lower(), ""),
+)
 
 
 def is_ignored(path):
@@ -415,7 +491,9 @@ def monitor_usb():
             return
 
         while True:
-            event = next_wmi_event(watcher)
+            event = next_wmi_event("usb_volume", watcher)
+            if event is WATCHER_DEAD:
+                return
             if event is None:
                 continue
 

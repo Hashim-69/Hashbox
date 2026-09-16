@@ -42,13 +42,28 @@ not carry the command line, so that one field is read back with psutil; if the
 process already exited or is protected, `cmdline` is `null` and the rest of the
 row is still intact. This class requires elevation, which is why the task runs
 with highest privileges — and if that elevation is missing, the failure is
-recorded as a `monitor_error` row rather than silently killing the thread.
+recorded as a `monitor_error` row rather than silently killing the thread. The
+same applies if a watcher dies later on, which happens if the WMI service
+restarts: the thread writes a `monitor_error` and exits deliberately instead of
+letting the exception unwind it with nothing in the DB to explain the silence.
 
 Command lines are passed through a redaction denylist before storage, so
-`--password`, `--token`, `-H`, attached `-p<value>` and recognisable key shapes
-(`ghp_`, `sk-`, `AKIA`, …) become `<redacted>`. It is damage reduction rather
-than a guarantee — no denylist knows every tool's flags — so the directory ACL
-remains the real protection.
+`--password`, `--token`, `-H` (both `-H value` and curl's attached `-Hvalue`),
+mysql-style attached `-p<value>` and recognisable key shapes (`ghp_`, `sk-`,
+`AKIA`, …) become `<redacted>`. It is damage reduction rather than a guarantee —
+no denylist knows every tool's flags — so the directory ACL remains the real
+protection.
+
+The `-p` rule is deliberately narrow, because `-p` is the most overloaded short
+flag on Windows: `powershell -psconsolefile`, `msbuild -p:Config=Release`,
+`tar -pxvf` and `node -print` all start with `-p`, and redacting those would
+destroy exactly the arguments an incident needs to read. So a value that could
+be a long-form flag name, or that begins with a colon, is left alone; only
+shapes that cannot be a flag (`-phunter2!`) are redacted. A password composed
+purely of letters and digits therefore survives into the log — losing one of
+those costs less than blinding the recorder to `-psconsolefile`. Likewise
+`sk-` and `AKIA`/`ASIA` require full real-world key length rather than a loose
+8-character tail, so a path like `sk-experiments-01` is not mistaken for a key.
 
 **Network.** psutil has no event API, so this polls — the one continuously
 running cost in the program, measured at ~2.1 ms per poll, or about 0.04 % of a
